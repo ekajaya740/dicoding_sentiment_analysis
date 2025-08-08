@@ -1,90 +1,136 @@
-import time
+import os
 import csv
-from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
-from selenium.common.exceptions import NoSuchElementException
-from bs4 import BeautifulSoup
-from webdriver_manager.chrome import ChromeDriverManager
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.common.by import By
+import time
+from googleapiclient.discovery import build
+from datetime import datetime
+from dotenv import load_dotenv
+
+load_dotenv()
+
+API_KEY = os.getenv("YOUTUBE_API_KEY")
+VIDEO_ID = os.getenv("VIDEO_ID")
+MAX_RESULTS = 100
+REQUEST_DELAY = 0.1
 
 
-service = Service(ChromeDriverManager().install())
-driver = webdriver.Chrome(service=service)
-
-wait = WebDriverWait(driver, 10)
+def setup_youtube_client():
+    return build("youtube", "v3", developerKey=API_KEY)
 
 
-url = "https://www.imdb.com/title/tt0068646/reviews/?spoilers=EXCLUDE"
-
-print("Opening the page with Selenium...")
-driver.get(url)
-
-review_section_locator = (By.CSS_SELECTOR, "section.ipc-page-section")
-pagination_locator = (By.CSS_SELECTOR, "div.pagination-container")
-all_button_locator = (
-    By.CSS_SELECTOR,
-    "div.pagination-container > :nth-child(2) > button",
-)
-next_25_button_locator = (
-    By.CSS_SELECTOR,
-    "div.pagination-container > span > button",
-)
-
-
-review_section = wait.until(EC.presence_of_element_located(review_section_locator))
-all_button = wait.until(EC.element_to_be_clickable(all_button_locator))
-
-driver.execute_script("arguments[0].click();", all_button)
-
-time.sleep(600)
-
-
-review_articles = wait.until(
-    EC.presence_of_all_elements_located((By.CSS_SELECTOR, "article.user-review-item"))
-)
-
-all_reviews_data = []
-
-print(f"Found {len(review_articles)} reviews to process...")
-
-
-for review in review_articles:
+def get_video_info(client, video_id):
     try:
-        star_rating = review.find_element(
-            By.CSS_SELECTOR, "span.review-rating > span"
-        ).text
-        title = review.find_element(By.CSS_SELECTOR, "div.ipc-title").text
-        description = review.find_element(By.CSS_SELECTOR, "div.ipc-overflowText").text
+        request = client.videos().list(part="snippet,statistics", id=video_id)
+        response = request.execute()
 
-        all_reviews_data.append(
-            {"rating": star_rating, "title": title, "description": description}
-        )
-
+        if response["items"]:
+            video = response["items"][0]
+            stats = video["statistics"]
+            return {
+                "title": video["snippet"]["title"],
+                "views": int(stats.get("viewCount", 0)),
+                "likes": int(stats.get("likeCount", 0)),
+                "comments": int(stats.get("commentCount", 0)),
+            }
     except Exception as e:
-
-        print(f"Skipping a malformed review card. Error: {e}")
-        continue
-
-print(f"Successfully extracted data from {len(all_reviews_data)} reviews.")
+        print(f"Error fetching video info: {e}")
+    return None
 
 
-csv_file_name = "reviews.csv"
+def get_all_comments(client, video_id):
+    all_comments = []
+    next_page_token = None
+
+    while True:
+        try:
+            request = client.commentThreads().list(
+                part="snippet,replies",
+                videoId=video_id,
+                maxResults=MAX_RESULTS,
+                pageToken=next_page_token,
+                textFormat="plainText",
+            )
+            response = request.execute()
+
+            for item in response["items"]:
+
+                main_comment = item["snippet"]["topLevelComment"]["snippet"]
+                comment_data = {
+                    "id": item["snippet"]["topLevelComment"]["id"],
+                    "author": main_comment["authorDisplayName"],
+                    "date": main_comment["publishedAt"],
+                    "text": main_comment["textDisplay"],
+                    "likes": main_comment["likeCount"],
+                    "reply_count": item["snippet"]["totalReplyCount"],
+                    "is_reply": False,
+                }
+                all_comments.append(comment_data)
+
+                if "replies" in item:
+                    for reply in item["replies"]["comments"]:
+                        reply_snippet = reply["snippet"]
+                        reply_data = {
+                            "id": reply["id"],
+                            "author": reply_snippet["authorDisplayName"],
+                            "date": reply_snippet["publishedAt"],
+                            "text": reply_snippet["textDisplay"],
+                            "likes": reply_snippet["likeCount"],
+                            "reply_count": 0,
+                            "is_reply": True,
+                        }
+                        all_comments.append(reply_data)
+
+            next_page_token = response.get("nextPageToken")
+            if not next_page_token:
+                break
+
+            time.sleep(REQUEST_DELAY)
+
+        except Exception as e:
+            print(f"Error fetching comments: {e}")
+            break
+
+    return all_comments
 
 
-csv_headers = ["rating", "title", "description"]
-
-try:
-    with open(csv_file_name, "w", newline="", encoding="utf-8") as file:
-
-        writer = csv.DictWriter(file, fieldnames=csv_headers)
-
+def save_comments_to_csv(comments, filename, folder="dataset"):
+    os.makedirs(folder, exist_ok=True)
+    file_path = os.path.join(folder, filename)
+    with open(file_path, "w", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(
+            file,
+            fieldnames=[
+                "id",
+                "author",
+                "date",
+                "text",
+                "likes",
+                "reply_count",
+                "is_reply",
+            ],
+        )
         writer.writeheader()
+        writer.writerows(comments)
 
-        writer.writerows(all_reviews_data)
+    print(f"Saved {len(comments)} comments to {file_path}")
+    return file_path
 
-    print(f"\nSuccessfully saved data to {csv_file_name}")
 
-except IOError:
-    print("I/O error while writing to the CSV file.")
+def main():
+    print("Scraping Video Comments...")
+    youtube = setup_youtube_client()
+    get_video_info(youtube, VIDEO_ID)
+    comments = get_all_comments(youtube, VIDEO_ID)
+
+    if not comments:
+        print("No comments found!")
+        return
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"youtube_comments_{timestamp}.csv"
+    save_comments_to_csv(comments, filename)
+
+    print(f"Saved {len(comments)} comments to {filename}")
+
+
+if __name__ == "__main__":
+    main()
